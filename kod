@@ -1,0 +1,506 @@
+import asyncio
+import logging
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.preprocessing import StandardScaler
+import warnings
+import io
+
+warnings.filterwarnings('ignore')
+
+# Токен бота
+API_TOKEN = '8108214750:AAFujCyIm1P2JMv6gFD63hHmg3UrJ67r7Ag'
+
+# Инициализация бота
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher()
+
+# Глобальные переменные для моделей и данных
+data = None
+lr_model = None
+knn_model = None
+knn_scaler = None
+district_to_code = None
+
+# Районы
+available_districts = ['Центральный', 'Кировский', 'Ленинский', 'Заводский', 'Кедровский']
+
+# Словарь для хранения состояний пользователей
+user_states = {}
+
+
+# 1. Функции для работы с данными
+def create_sample_data():
+    """Создание тестовых данных с новыми районами"""
+    np.random.seed(42)
+    n_samples = 250
+
+    data_dict = {
+        'area': [],
+        'rooms': [],
+        'price': [],
+        'district': []
+    }
+
+    district_params = {
+        'Центральный': {'area_range': (40, 90), 'price_mult': 1.4},
+        'Кировский': {'area_range': (45, 100), 'price_mult': 1.1},
+        'Ленинский': {'area_range': (50, 110), 'price_mult': 1.2},
+        'Заводский': {'area_range': (35, 95), 'price_mult': 1.0},
+        'Кедровский': {'area_range': (55, 120), 'price_mult': 1.15}
+    }
+
+    # Распределяем квартиры по районам
+    for i in range(n_samples):
+        district_idx = i % len(available_districts)
+        district = available_districts[district_idx]
+        params = district_params[district]
+
+        rooms = np.random.choice([1, 2, 3, 4], p=[0.2, 0.4, 0.3, 0.1])
+
+        base_area_per_room = {1: 35, 2: 55, 3: 75, 4: 95}
+        base_area = base_area_per_room.get(rooms, 50)
+        area = base_area + np.random.randint(-10, 15)
+        area = max(30, min(area, 150))
+
+        base_price = 18000
+        area_price = area * 280
+        rooms_price = rooms * 4500
+
+        price = (base_price + area_price + rooms_price) * params['price_mult']
+        price += np.random.randint(-2000, 2000)
+
+        data_dict['area'].append(area)
+        data_dict['rooms'].append(rooms)
+        data_dict['price'].append(int(price))
+        data_dict['district'].append(district)
+
+    return pd.DataFrame(data_dict)
+
+
+def prepare_data(df):
+    """Подготовка данных для обучения"""
+    global district_to_code
+
+    unique_districts = sorted(df['district'].unique())
+    district_to_code = {district: i for i, district in enumerate(unique_districts)}
+    df['district_code'] = df['district'].map(district_to_code)
+
+    # Линейная регрессия: площадь, комнаты, район
+    X_reg = df[['area', 'rooms', 'district_code']]
+    y_reg = df['price']
+
+    # KNN: только площадь и комнаты
+    X_knn = df[['area', 'rooms']]
+    y_knn = df['price']
+
+    return X_reg, y_reg, X_knn, y_knn
+
+
+def train_models():
+    """Обучение моделей"""
+    global data, lr_model, knn_model, knn_scaler
+
+    # Создаем или загружаем данные
+    if data is None:
+        data = create_sample_data()
+
+    # Подготавливаем данные
+    X_reg, y_reg, X_knn, y_knn = prepare_data(data)
+
+    # Разделяем данные
+    X_reg_train, _, y_reg_train, _ = train_test_split(X_reg, y_reg, test_size=0.2, random_state=42)
+    X_knn_train, _, y_knn_train, _ = train_test_split(X_knn, y_knn, test_size=0.2, random_state=42)
+
+    # Обучаем линейную регрессию
+    lr_model = LinearRegression()
+    lr_model.fit(X_reg_train, y_reg_train)
+
+    # Обучаем KNN
+    knn_scaler = StandardScaler()
+    X_knn_train_scaled = knn_scaler.fit_transform(X_knn_train)
+    knn_model = KNeighborsRegressor(n_neighbors=5)
+    knn_model.fit(X_knn_train_scaled, y_knn_train)
+
+
+def predict_price(district_name, rooms):
+    """Прогнозирование цены двумя методами"""
+    global data, lr_model, knn_model, knn_scaler, district_to_code
+
+    # Проверяем, есть ли район в базе данных
+    if district_name not in district_to_code:
+        # Если район не найден, используем первый из списка
+        district_name = list(district_to_code.keys())[0]
+
+    # Получаем статистику по району для автоматического подбора параметров
+    district_data = data[data['district'] == district_name]
+
+    if len(district_data) == 0:
+        # Если нет данных по району, используем средние значения
+        avg_area = data['area'].mean()
+    else:
+        # Фильтруем по количеству комнат
+        rooms_data = district_data[district_data['rooms'] == rooms]
+        if len(rooms_data) > 0:
+            # Берем РЕАЛЬНУЮ среднюю площадь из существующих данных
+            avg_area = rooms_data['area'].mean()
+            # Берем РЕАЛЬНУЮ среднюю цену из существующих данных
+            avg_price_for_rooms = rooms_data['price'].mean()
+        else:
+            avg_area = district_data['area'].mean()
+            avg_price_for_rooms = district_data['price'].mean()
+
+    # Ограничиваем значение площади
+    area = max(30, min(avg_area, 150))
+
+    # Прогноз линейной регрессией
+    district_code = district_to_code.get(district_name, 0)
+    features_lr = np.array([[area, rooms, district_code]])
+    price_lr = lr_model.predict(features_lr)[0]
+
+    # Прогноз методом ближайших соседей
+    features_knn = np.array([[area, rooms]])
+    features_knn_scaled = knn_scaler.transform(features_knn)
+    price_knn = knn_model.predict(features_knn_scaled)[0]
+
+    # Находим ближайших соседей - реальные квартиры из базы
+    distances, indices = knn_model.kneighbors(features_knn_scaled)
+    nearest_neighbors = data.iloc[indices[0]]
+
+    # Находим РЕАЛЬНУЮ квартиру в базе, наиболее близкую к прогнозируемой
+    # Ищем квартиру с таким же количеством комнат и близкой площадью
+    same_rooms_data = data[(data['rooms'] == rooms) & (data['district'] == district_name)]
+
+    if len(same_rooms_data) > 0:
+        # Находим самую близкую по площади реальную квартиру
+        same_rooms_data = same_rooms_data.copy()
+        same_rooms_data['area_diff'] = abs(same_rooms_data['area'] - area)
+        closest_real_apartment = same_rooms_data.nsmallest(1, 'area_diff')
+
+        # Используем реальные координаты этой квартиры
+        real_area = float(closest_real_apartment['area'].iloc[0])
+        real_price = float(closest_real_apartment['price'].iloc[0])
+    else:
+        # Если нет квартир с таким же количеством комнат, используем средние значения
+        real_area = area
+        real_price = price_knn
+
+    return {
+        'district': district_name,
+        'rooms': rooms,
+        'area': round(area, 1),
+        'real_area': round(real_area, 1),
+        'real_price': round(real_price, 0),
+        'price_lr': int(price_lr),
+        'price_knn': int(price_knn),
+        'district_avg_price': int(district_data['price'].mean()) if len(district_data) > 0 else int(
+            data['price'].mean()),
+        'nearest_neighbors': nearest_neighbors,
+        'avg_price_for_rooms': int(avg_price_for_rooms) if 'avg_price_for_rooms' in locals() else int(
+            district_data['price'].mean())
+    }
+
+
+def create_knn_plot(results):
+    """Создание простого графика"""
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    # Получаем данные по району и количеству комнат
+    district_data = data[data['district'] == results['district']]
+    same_rooms_data = district_data[district_data['rooms'] == results['rooms']]
+
+    # Отображаем квартиры с выбранным количеством комнат
+    if len(same_rooms_data) > 0:
+        ax.scatter(same_rooms_data['area'], same_rooms_data['price'],
+                   alpha=0.6, s=50, color='blue')
+
+    # Отмечаем прогнозируемую квартиру красным крестиком
+    ax.scatter(results['real_area'], results['real_price'],
+               s=150, marker='x', color='red', linewidth=3)
+
+    # Горизонтальная линия - прогноз KNN
+    ax.axhline(y=results['price_knn'], color='green',
+               linestyle='-', linewidth=2, alpha=0.7)
+
+    # Горизонтальная линия - средняя цена для такого количества комнат
+    ax.axhline(y=results['avg_price_for_rooms'], color='orange',
+               linestyle='--', linewidth=1.5, alpha=0.7)
+
+    # Настройки графика
+    ax.set_xlabel('Площадь (м²)')
+    ax.set_ylabel('Цена (руб.)')
+    ax.set_title(f'Анализ цен: {results["district"]}, {results["rooms"]} комн.')
+
+    # Добавляем сетку
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    # Сохраняем график в буфер
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=100, facecolor='white')
+    buf.seek(0)
+    plt.close()
+
+    return buf
+
+
+def create_districts_keyboard():
+    """Создание клавиатуры с районами"""
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Центральный")],
+            [KeyboardButton(text="Кировский")],
+            [KeyboardButton(text="Ленинский")],
+            [KeyboardButton(text="Заводский")],
+            [KeyboardButton(text="Кедровский")],
+            [KeyboardButton(text="Отмена")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
+
+
+def create_rooms_keyboard():
+    """Создание клавиатуры с количеством комнат"""
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="1"), KeyboardButton(text="2")],
+            [KeyboardButton(text="3"), KeyboardButton(text="4")],
+            [KeyboardButton(text="Отмена")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
+
+
+def remove_user_state(user_id):
+    """Удаление состояния пользователя"""
+    if user_id in user_states:
+        del user_states[user_id]
+
+
+def set_user_state(user_id, state, district=None):
+    """Установка состояния пользователя"""
+    user_states[user_id] = {'state': state}
+    if district:
+        user_states[user_id]['district'] = district
+
+
+def get_user_state(user_id):
+    """Получение состояния пользователя"""
+    return user_states.get(user_id)
+
+
+# 2. Обработчики команд бота
+@dp.message(Command("start"))
+async def cmd_start(message):
+    """Обработчик команды /start"""
+    welcome_text = """
+Добро пожаловать в бот для прогнозирования стоимости аренды квартир!
+
+Я помогу вам определить стоимость аренды квартиры с помощью двух методов:
+1. Линейная регрессия
+2. Метод ближайших соседей
+
+Доступные районы:
+• Центральный
+• Кировский
+• Ленинский
+• Заводский
+• Кедровский
+
+Нажмите /predict чтобы начать!
+    """
+    await message.answer(welcome_text)
+
+
+@dp.message(Command("help"))
+async def cmd_help(message):
+    """Обработчик команды /help"""
+    help_text = """
+Как пользоваться ботом:
+
+1. Нажмите /predict
+2. Выберите район из предложенных вариантов
+3. Выберите количество комнат (1-4)
+4. Получите прогноз стоимости с графиком
+
+Для начала нажмите /predict
+    """
+    await message.answer(help_text)
+
+
+@dp.message(Command("predict"))
+async def cmd_predict(message):
+    """Начало процесса прогнозирования"""
+    user_id = message.from_user.id
+    set_user_state(user_id, 'waiting_for_district')
+    await message.answer(
+        "Выберите район расположения квартиры:",
+        reply_markup=create_districts_keyboard()
+    )
+
+
+async def handle_district_selection(message):
+    """Обработка выбора района"""
+    user_id = message.from_user.id
+    user_state = get_user_state(user_id)
+
+    if not user_state or user_state['state'] != 'waiting_for_district':
+        return False
+
+    if message.text == "Отмена":
+        remove_user_state(user_id)
+        await message.answer("Прогнозирование отменено.", reply_markup=types.ReplyKeyboardRemove())
+        return True
+
+    # Проверяем, что выбранный район есть в списке доступных
+    if message.text not in available_districts:
+        await message.answer(
+            "Пожалуйста, выберите район из предложенных вариантов:",
+            reply_markup=create_districts_keyboard()
+        )
+        return True
+
+    set_user_state(user_id, 'waiting_for_rooms', message.text)
+
+    await message.answer(
+        f"Выбран район: {message.text}\n\n"
+        f"Теперь выберите количество комнат:",
+        reply_markup=create_rooms_keyboard()
+    )
+    return True
+
+
+async def handle_rooms_selection(message):
+    """Обработка выбора количества комнат и расчет стоимости"""
+    user_id = message.from_user.id
+    user_state = get_user_state(user_id)
+
+    if not user_state or user_state['state'] != 'waiting_for_rooms':
+        return False
+
+    if message.text == "Отмена":
+        remove_user_state(user_id)
+        await message.answer("Прогнозирование отменено.", reply_markup=types.ReplyKeyboardRemove())
+        return True
+
+    if message.text not in ["1", "2", "3", "4"]:
+        await message.answer(
+            "Пожалуйста, выберите количество комнат из предложенных вариантов:",
+            reply_markup=create_rooms_keyboard()
+        )
+        return True
+
+    rooms = int(message.text)
+    district = user_state.get('district')
+
+    if not district:
+        remove_user_state(user_id)
+        await message.answer("Ошибка: район не выбран. Начните заново с /predict")
+        return True
+
+    # Удаляем состояние пользователя
+    remove_user_state(user_id)
+
+    # Показываем ожидание
+    await message.answer("Рассчитываю стоимость и создаю график...")
+
+    try:
+        # Получаем прогноз
+        results = predict_price(district, rooms)
+
+        # Формируем текстовый ответ
+        response_text = f"""
+РЕЗУЛЬТАТЫ ПРОГНОЗИРОВАНИЯ
+
+Район: {results['district']}
+Комнат: {results['rooms']}
+Прогнозируемая площадь: {results['area']} м²
+Ближайшая реальная квартира: {results['real_area']} м²
+
+ПРОГНОЗ СТОИМОСТИ:
+1. Линейная регрессия: {results['price_lr']:,} руб./мес.
+2. Метод ближайших соседей: {results['price_knn']:,} руб./мес.
+
+СРЕДНИЕ ЦЕНЫ:
+• Средняя цена для {results['rooms']} комн.: {results['avg_price_for_rooms']:,} руб./мес.
+• Средняя цена в районе: {results['district_avg_price']:,} руб./мес.
+        """.replace(',', ' ')
+
+        # Создаем график с реальными позициями
+        plot_buffer = create_knn_plot(results)
+
+        # Отправляем сообщение с графиком
+        await message.answer_photo(
+            types.BufferedInputFile(plot_buffer.read(), filename="knn_plot.png"),
+            caption=response_text
+        )
+
+    except Exception as e:
+        await message.answer(f"Произошла ошибка при расчете: {str(e)}")
+
+    finally:
+        await message.answer("Для нового расчета нажмите /predict",
+                             reply_markup=types.ReplyKeyboardRemove())
+
+    return True
+
+
+@dp.message()
+async def handle_all_messages(message):
+    """Обработка всех сообщений"""
+    # Сначала проверяем команды
+    if message.text.startswith('/'):
+        # Если это команда, но не обработана выше, показываем сообщение
+        await message.answer(
+            "Я не понимаю эту команду.\n\n"
+            "Доступные команды:\n"
+            "/start - Начало работы\n"
+            "/predict - Прогнозировать стоимость\n"
+            "/help - Помощь"
+        )
+        return
+
+    # Проверяем, не выбирает ли пользователь район
+    if await handle_district_selection(message):
+        return
+
+    # Проверяем, не выбирает ли пользователь комнаты
+    if await handle_rooms_selection(message):
+        return
+
+    # Если не команда и не выбор, показываем сообщение
+    await message.answer(
+        "Я не понимаю это сообщение.\n\n"
+        "Доступные команды:\n"
+        "/start - Начало работы\n"
+        "/predict - Прогнозировать стоимость\n"
+        "/help - Помощь"
+    )
+
+
+# 3. Запуск бота
+async def main():
+    """Основная функция запуска бота"""
+    # Отключаем логирование
+    logging.getLogger('aiogram').setLevel(logging.WARNING)
+
+    # Обучаем модели без вывода сообщений
+    train_models()
+
+    # Запускаем бота
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    # Запускаем бота
+    asyncio.run(main())
