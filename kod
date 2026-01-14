@@ -209,7 +209,7 @@ def predict_price(district_name, rooms):
 
 
 def create_knn_plot(results):
-    """Создание простого графика"""
+    """Создание простого графика без линий стоимости"""
     fig, ax = plt.subplots(figsize=(8, 6))
 
     # Получаем данные по району и количеству комнат
@@ -225,13 +225,7 @@ def create_knn_plot(results):
     ax.scatter(results['real_area'], results['real_price'],
                s=150, marker='x', color='red', linewidth=3)
 
-    # Горизонтальная линия - прогноз KNN
-    ax.axhline(y=results['price_knn'], color='green',
-               linestyle='-', linewidth=2, alpha=0.7)
-
-    # Горизонтальная линия - средняя цена для такого количества комнат
-    ax.axhline(y=results['avg_price_for_rooms'], color='orange',
-               linestyle='--', linewidth=1.5, alpha=0.7)
+    # НЕТ горизонтальных линий стоимости - убраны
 
     # Настройки графика
     ax.set_xlabel('Площадь (м²)')
